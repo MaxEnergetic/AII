@@ -8,16 +8,25 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
+import argparse
+
 from model import ResNet32
 
 
 def main():
-    seed = 42
-    batch_size = 128
-    epochs = 20
-    learning_rate = 1e-3
-    weight_decay = 1e-4
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
+    seed = args.seed
+    batch_size = args.batch_size
+    epochs = args.epochs
+    learning_rate = args.lr
+    weight_decay = args.weight_decay
     torch.manual_seed(seed)
     device = torch.device("cuda")
 
@@ -111,6 +120,8 @@ def main():
             "val_loss", "val_accuracy", "seconds",
         ])
 
+        best_val_accuracy = -1.0
+
         for epoch in range(1, epochs + 1):
             start = time.perf_counter()
 
@@ -168,6 +179,29 @@ def main():
             train_accuracy = train_correct / train_count
             val_loss = val_loss_sum / val_count
             val_accuracy = val_correct / val_count
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "val_accuracy": val_accuracy,
+                        "config": {
+                            "seed": seed,
+                            "batch_size": batch_size,
+                            "learning_rate": learning_rate,
+                            "weight_decay": weight_decay,
+                            "epochs": epochs,
+                        },
+                    },
+                    run_dir / "model_best.pt",
+                )
+
+                print(
+                    f"  Сохранена лучшая модель: эпоха {epoch}, "
+                    f"val accuracy {val_accuracy:.1%}"
+                )
             seconds = time.perf_counter() - start
 
             writer.writerow([
