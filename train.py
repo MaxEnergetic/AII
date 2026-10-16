@@ -3,6 +3,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from torch.utils.data import DataLoader, Subset, RandomSampler
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset
@@ -20,6 +22,13 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
+
+    
+    parser.add_argument(
+        "--sampling",
+        choices=["without_replacement", "with_replacement"],
+        default="without_replacement",
+    )
     args = parser.parse_args()
 
     seed = args.seed
@@ -65,7 +74,7 @@ def main():
     )
 
     targets = torch.tensor(train_source.targets)
-    split_generator = torch.Generator().manual_seed(seed)
+    split_generator = torch.Generator().manual_seed(42)
     train_indices = []
     val_indices = []
 
@@ -84,13 +93,24 @@ def main():
         run_dir / "split.pt",
     )
 
-    train_loader = DataLoader(
-        Subset(train_source, train_indices),
-        batch_size=batch_size,
-        shuffle=True,
+    train_dataset = Subset(train_source, train_indices)
+
+    sampler = RandomSampler(
+        train_dataset,
+        replacement=(args.sampling == "with_replacement"),
+        num_samples=len(train_dataset),
         generator=torch.Generator().manual_seed(seed + 1),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        generator=torch.Generator().manual_seed(seed + 2),
         num_workers=0,
     )
+
+    print("Сэмплирование:", args.sampling)
     val_loader = DataLoader(
         Subset(val_source, val_indices),
         batch_size=batch_size,
@@ -193,6 +213,8 @@ def main():
                             "learning_rate": learning_rate,
                             "weight_decay": weight_decay,
                             "epochs": epochs,
+                            "sampling": args.sampling,
+                            "split_seed": 42
                         },
                     },
                     run_dir / "model_best.pt",
