@@ -226,6 +226,7 @@ def main():
                 )
             seconds = time.perf_counter() - start
 
+
             writer.writerow([
                 epoch, train_loss, train_accuracy,
                 val_loss, val_accuracy, seconds,
