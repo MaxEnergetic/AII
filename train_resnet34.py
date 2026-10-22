@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--crop-padding", type=int, default=4)
 
     
     parser.add_argument(
@@ -49,7 +50,7 @@ def main():
     )
 
     train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(32, padding=args.crop_padding),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize,
@@ -229,9 +230,11 @@ def main():
                         "model_state_dict": model.state_dict(),
                         "val_accuracy": val_accuracy,
                         "config": {
+                            
                             "seed": seed,
                             "batch_size": batch_size,
                             "learning_rate": learning_rate,
+                            "crop_padding": args.crop_padding,
                             "weight_decay": weight_decay,
                             "epochs": epochs,
                             "sampling": args.sampling,
