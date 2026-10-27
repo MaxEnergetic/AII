@@ -22,15 +22,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    # Settings from the successful 20261023_001356 run (validation 65.25%).
+    parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--crop-padding", type=int, default=4)
     parser.add_argument(
-    "--sampler",
-    choices=["custom", "torch"],
-    default="custom",
-)
+        "--sampler", choices=["custom", "torch"], default="custom",
+    )
 
     
     parser.add_argument(
@@ -104,9 +103,12 @@ def main():
 
     train_dataset = Subset(train_source, train_indices)
     
-    sampler = NoReplacementSampler(train_dataset, seed=seed + 1)    
-
-    if args.sampler == "custom":
+    if args.sampling == "with_replacement":
+        sampler = RandomSampler(
+            train_dataset, replacement=True, num_samples=len(train_dataset),
+            generator=torch.Generator().manual_seed(seed + 1),
+        )
+    elif args.sampler == "custom":
         sampler = NoReplacementSampler(
             train_dataset,
             seed=seed + 1,

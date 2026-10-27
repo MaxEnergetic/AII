@@ -1,0 +1,1 @@
+epoch,train_loss,train_accuracy,val_loss,val_accuracy,seconds,train_examples,full_train_examples,kept_fraction,train_batches,cumulative_train_examples,train_seconds,validation_seconds,cumulative_seconds,val_worst_group_accuracy,pi_min,pi_max,pi_entropy,max_model_bonus,learning_rate

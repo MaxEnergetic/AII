@@ -1,13 +1,18 @@
+"""ALSO, adapted for weight-dependent subsampling in AII.
+
+Based on brain-lab-research/ALSO (Apache-2.0; see ALSO_LICENSE.txt).
+Local changes: separate model-weight bonuses and group-loss corrections.
+The original Adam/optimistic parameter-update algorithm is preserved.
+"""
+
 import torch
-import numpy as np
 import math
 
-from typing import List, Tuple, Dict, Optional, Callable, Union, Any, Iterable
-from typing_extensions import ParamSpec, Self, TypeAlias
+from typing import Tuple, Dict, Optional, Union, Any, Iterable
 from torch import Tensor
 
 
-ParamsT: TypeAlias = Union[
+ParamsT = Union[
     Iterable[torch.Tensor], Iterable[dict[str, Any]], Iterable[tuple[str, torch.Tensor]]
 ]
 
@@ -28,7 +33,7 @@ class ALSO(torch.optim.Optimizer):
         weight_decay: float = 1e-3,
         pi_lr: float = 1e-3, 
         pi_decay: float = 1e-2, 
-        eps: float = np.finfo(np.float32).eps, 
+        eps: float = torch.finfo(torch.float32).eps,
         amsgrad: bool = False,
     ):
         """
@@ -160,11 +165,26 @@ class ALSO(torch.optim.Optimizer):
         pi_new_log /= 1 + self.pi_decay * self.pi_lr
         return torch.nn.functional.softmax(pi_new_log, dim=-1)
 
-    def _descent_ascent_step(self, closure, groups_indexes) -> float:
+    def _group_gradient(self, losses, groups_indexes, pi_loss_multipliers):
+        """Correct observation frequency only for the pi update, if requested."""
+        values = -losses.detach().flatten()
+        if values.numel() != groups_indexes.numel():
+            raise ValueError("Closure must return one scaled loss per sample")
+        if pi_loss_multipliers is not None:
+            values = values * pi_loss_multipliers[groups_indexes]
+        pi_grad = torch.zeros_like(self.pi, requires_grad=False)
+        pi_grad.index_add_(0, groups_indexes, values)
+        return pi_grad
+
+    def _descent_ascent_step(
+        self, closure, groups_indexes, model_weight_multipliers, pi_loss_multipliers,
+    ) -> float:
         """Perform a descent-ascent optimization step."""
 
         # Compute gradients using pi
         pi_selected = self.pi[groups_indexes]
+        if model_weight_multipliers is not None:
+            pi_selected = pi_selected * model_weight_multipliers[groups_indexes]
         losses, _ = closure(pi_selected, self.loss_scale)
         loss = losses.mean().item()
 
@@ -176,9 +196,7 @@ class ALSO(torch.optim.Optimizer):
                 p.data.add_(self._compute_adam_step(p, group))
 
         # Update pi
-        pi_grad_compressed = -losses.clone().detach()
-        pi_grad = torch.zeros_like(self.pi, requires_grad=False)
-        pi_grad.index_add_(0, groups_indexes.flatten(), pi_grad_compressed.flatten())
+        pi_grad = self._group_gradient(losses, groups_indexes, pi_loss_multipliers)
         self.pi = self._update_pi(pi_grad)
         return loss
 
@@ -203,11 +221,15 @@ class ALSO(torch.optim.Optimizer):
         else:
             self.__pi_intermediate = self.pi.clone()
 
-    def _optimistic_main_step(self, closure, groups_indexes) -> float:
+    def _optimistic_main_step(
+        self, closure, groups_indexes, model_weight_multipliers, pi_loss_multipliers,
+    ) -> float:
         """Perform the main step in optimistic mode."""
 
         # Compute gradients using intermediate pi
         pi_selected = self.__pi_intermediate[groups_indexes]
+        if model_weight_multipliers is not None:
+            pi_selected = pi_selected * model_weight_multipliers[groups_indexes]
         losses, _ = closure(pi_selected, self.loss_scale)
         loss = losses.mean().item()
 
@@ -225,36 +247,60 @@ class ALSO(torch.optim.Optimizer):
                 param_idx += 1
 
         # Update pi
-        pi_grad_compressed = -losses.clone().detach()
-        pi_grad = torch.zeros_like(self.pi, requires_grad=False)
-        pi_grad.index_add_(0, groups_indexes.flatten(), pi_grad_compressed.flatten())
+        pi_grad = self._group_gradient(losses, groups_indexes, pi_loss_multipliers)
         self.__prev_grads_pi = pi_grad
         self.pi = self._update_pi(pi_grad)
         return loss
 
-    def step(self, closure, groups_indexes) -> float:
+    def step(
+        self, closure, groups_indexes, *, model_weight_multipliers=None,
+        pi_loss_multipliers=None,
+    ) -> float:
         """
         Perform a single optimization step.
         
         Args:
             closure: A callable that takes pi_selected and loss_scale, returns losses and other outputs
             groups_indexes: Tensor of group indices for the current batch
+            model_weight_multipliers: Optional length-K vector. Boosts the
+                selected pi for model backprop only; does not overwrite pi.
+            pi_loss_multipliers: Optional length-K vector. Corrects group
+                observation frequency for the pi update only.
+
+        Closure must backprop using the supplied weights, but return scaled
+        UNWEIGHTED per-example losses. With both multipliers omitted, the
+        original ALSO update is unchanged. The bonus is not renormalized.
             
         Returns:
             float: The mean loss value
         """
-        # Get device from the closure
-        if hasattr(closure, 'device'):
-            self._move_pi_to_device(closure.device)
+        device = getattr(closure, 'device', self.param_groups[0]['params'][0].device)
+        self._move_pi_to_device(device)
+        groups_indexes = torch.as_tensor(groups_indexes, device=device, dtype=torch.long).flatten()
+        if (groups_indexes.numel() == 0 or (groups_indexes < 0).any()
+                or (groups_indexes >= self.pi.numel()).any()):
+            raise ValueError("Invalid group indices")
 
-            # Ensure groups_indexes is a tensor
-            if not isinstance(groups_indexes, torch.Tensor):
-                groups_indexes = torch.tensor(groups_indexes, device=closure.device)
+        def prepare(values):
+            if values is None:
+                return None
+            values = torch.as_tensor(values, device=device, dtype=self.pi.dtype).detach()
+            if (values.shape != self.pi.shape or not torch.isfinite(values).all()
+                    or (values <= 0).any()):
+                raise ValueError("Multipliers must be finite, positive, length-K vectors")
+            return values
+
+        model_weight_multipliers = prepare(model_weight_multipliers)
+        pi_loss_multipliers = prepare(pi_loss_multipliers)
 
         if self.mode == 'optimistic':
             self._optimistic_intermediate_step()
-            return self._optimistic_main_step(closure, groups_indexes)
+            return self._optimistic_main_step(
+                closure, groups_indexes, model_weight_multipliers, pi_loss_multipliers,
+            )
         elif self.mode == 'descent-ascent':
-            return self._descent_ascent_step(closure, groups_indexes)
+            return self._descent_ascent_step(
+                closure, groups_indexes, model_weight_multipliers, pi_loss_multipliers,
+            )
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")

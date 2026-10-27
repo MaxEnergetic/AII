@@ -1,0 +1,1 @@
+epoch,group,group_size,active_count,retention,pi_start,pi_smoothed,pi_end,model_multiplier,effective_weight_start,pi_loss_multiplier,train_seen,train_mean_loss,val_count,val_accuracy
