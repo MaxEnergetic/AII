@@ -1,0 +1,18 @@
+{
+  "epochs": 20,
+  "batch_size": 128,
+  "lr": 0.001,
+  "weight_decay": 0.001,
+  "seed": 42,
+  "sampling": "without_replacement",
+  "pi_lr": 0.001,
+  "pi_decay": 0.01,
+  "smoke_test": false,
+  "data_root": "C:\\repos\\AII\\AII\\data",
+  "optimizer": "ALSO",
+  "n_groups": 100,
+  "split_seed": 42,
+  "mode": "optimistic",
+  "alpha": 1.0,
+  "upstream_commit": "bc4a5d8de99de382fc87632da46357280b16e6b9"
+}

@@ -15,7 +15,6 @@ def main():
     train_loss = [float(row["train_loss"]) for row in rows]
     val_loss = [float(row["val_loss"]) for row in rows]
 
-    # В CSV точность записана долей: 0.55 означает 55%.
     train_acc = [100 * float(row["train_accuracy"]) for row in rows]
     val_acc = [100 * float(row["val_accuracy"]) for row in rows]
 

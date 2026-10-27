@@ -14,6 +14,9 @@ import argparse
 
 from torchvision.models import resnet34
 
+from sampler import NoReplacementSampler
+
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -23,6 +26,11 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--crop-padding", type=int, default=4)
+    parser.add_argument(
+    "--sampler",
+    choices=["custom", "torch"],
+    default="custom",
+)
 
     
     parser.add_argument(
@@ -95,13 +103,20 @@ def main():
     )
 
     train_dataset = Subset(train_source, train_indices)
+    
+    sampler = NoReplacementSampler(train_dataset, seed=seed + 1)    
 
-    sampler = RandomSampler(
-        train_dataset,
-        replacement=(args.sampling == "with_replacement"),
-        num_samples=len(train_dataset),
-        generator=torch.Generator().manual_seed(seed + 1),
-    )
+    if args.sampler == "custom":
+        sampler = NoReplacementSampler(
+            train_dataset,
+            seed=seed + 1,
+        )
+    else:
+        sampler = RandomSampler(
+            train_dataset,
+            replacement=False,
+            generator=torch.Generator().manual_seed(seed + 1),
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -148,6 +163,7 @@ def main():
         milestones=[10, 15],
         gamma=1 / 3,
     )
+    print("Класс семплера:", type(sampler).__name__)
 
     print(f"Train: {len(train_indices)}, validation: {len(val_indices)}")
     print(f"Батчей в обучающей эпохе: {len(train_loader)}")
@@ -244,6 +260,7 @@ def main():
                             "scheduler": "MultiStepLR",
                             "milestones": [10, 15],
                             "gamma": 1 / 3,
+                            "sampler_class": type(sampler).__name__,
                         },
                     },
                     run_dir / "model_best.pt",

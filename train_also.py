@@ -15,6 +15,7 @@ from torchvision import datasets, transforms
 import argparse
 
 from model import ResNet32
+from torchvision.models import resnet34
 
 
 def main():
@@ -137,7 +138,23 @@ def main():
     )
 
 
-    model = ResNet32(num_classes=100).to(device)
+    model = resnet34(weights=None, num_classes=100)
+
+    # Сохраняем разрешение маленьких картинок CIFAR-100 на входе.
+    model.conv1 = nn.Conv2d(
+        3, 64, kernel_size=3, stride=1, padding=1, bias=False,
+    )
+    model.maxpool = nn.Identity()
+
+    # Инициализируем новую свёртку в стиле torchvision ResNet.
+    nn.init.kaiming_normal_(
+        model.conv1.weight, mode="fan_out", nonlinearity="relu",
+    )
+
+    model = model.to(device)
+
+    print("Модель: torchvision ResNet34, вход адаптирован под CIFAR")
+    print(f"Количество параметров: {sum(p.numel() for p in model.parameters()):,}")
     criterion = nn.CrossEntropyLoss()
     pi_uniform = torch.full((100,), 1 / 100, device=device)
     optimizer = ALSO(
