@@ -24,14 +24,14 @@ class WeightAdaptiveSampler(Sampler):
     Call set_epoch BEFORE iterating the DataLoader. Counts stay fixed throughout
     that epoch. Every epoch draws a fresh subset without replacement; skipped
     items remain eligible next epoch. No extra items fill the freed positions.
-
+    
     The reference is the initial normalized pi, not the previous active count.
     Thus increasing pi can restore a group even after it hits the minimum.
     """
 
     def __init__(
         self, group_ids, reference_weights, seed=42, warmup_epochs=2,
-        min_fraction=0.1, min_per_group=16, weight_ema=0.5,
+        min_fraction=0.1, min_per_group=16, weight_ema=0.0,
         compensation=0.25,
     ):
         ids = torch.as_tensor(group_ids, device="cpu")
@@ -94,51 +94,3 @@ class WeightAdaptiveSampler(Sampler):
             self.active_counts = self.group_sizes.clone()
         else:
             fraction = (self.smoothed_weights / self.reference_weights).clamp(
-                min=self.min_fraction, max=1.0,
-            )
-            requested = torch.ceil(self.group_sizes * fraction).to(torch.long)
-            minimum = torch.minimum(
-                self.group_sizes, torch.full_like(self.group_sizes, self.min_per_group),
-            )
-            self.active_counts = torch.minimum(
-                self.group_sizes, torch.maximum(requested, minimum),
-            )
-
-        # Separate generator: deterministic selection does not consume model RNG.
-        generator = torch.Generator().manual_seed(self.seed + epoch)
-        chosen = [members[torch.randperm(len(members), generator=generator)[:count]]
-                  for members, count in zip(self.members, self.active_counts.tolist())]
-        active = torch.cat(chosen)
-        self.active_indices = active[torch.randperm(len(active), generator=generator)]
-        self.epoch = epoch
-
-    @property
-    def retention(self):
-        return self.active_counts.to(torch.float64) / self.group_sizes
-
-    @property
-    def overall_retention(self):
-        return int(self.active_counts.sum()) / self.full_size
-
-    @property
-    def model_weight_multipliers(self):
-        # Small, bounded bonus; NOT full inverse-probability compensation.
-        # Keep 20% with compensation=.25 -> multiply training weight by 1.20.
-        return 1 + self.compensation * (1 - self.retention)
-
-    @property
-    def pi_loss_multipliers(self):
-        # Original group frequency / selected group frequency. This corrects
-        # the pi signal only, not the model gradient. Exact frequency correction
-        # for fixed losses in expectation over the random subset/permutation;
-        # adaptive without-replacement training is not conditionally unbiased.
-        return self.overall_retention / self.retention
-
-    def __iter__(self):
-        if self.epoch == 0:
-            raise RuntimeError("Call set_epoch before iterating WeightAdaptiveSampler")
-        return iter(self.active_indices.tolist())
-
-    def __len__(self):
-        return int(self.active_counts.sum())
-
