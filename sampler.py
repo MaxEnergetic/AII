@@ -24,9 +24,10 @@ class WeightAdaptiveSampler(Sampler):
     Call set_epoch BEFORE iterating the DataLoader. Counts stay fixed throughout
     that epoch. Every epoch draws a fresh subset without replacement; skipped
     items remain eligible next epoch. No extra items fill the freed positions.
-    
-    The reference is the initial normalized pi, not the previous active count.
-    Thus increasing pi can restore a group even after it hits the minimum.
+
+    Compare weights at the start of consecutive epochs. Scale the previous
+    actual count by that ratio, subject to the group's floor and capacity.
+    Warmup uses full groups and still records each epoch's weight snapshot.
     """
 
     def __init__(
@@ -87,10 +88,58 @@ class WeightAdaptiveSampler(Sampler):
         weights = self._normalize_weights(weights)
         if weights.shape != self.reference_weights.shape:
             raise ValueError("Weights must have one entry per group")
-        self.smoothed_weights = (
-            self.weight_ema * self.smoothed_weights + (1 - self.weight_ema) * weights
-        )
+        previous_weights = self.smoothed_weights
+        self.smoothed_weights = weights
+        if self.weight_ema:
+            self.smoothed_weights = (
+                self.weight_ema * previous_weights + (1 - self.weight_ema) * weights
+            )
         if epoch <= self.warmup_epochs:
             self.active_counts = self.group_sizes.clone()
         else:
-            fraction = (self.smoothed_weights / self.reference_weights).clamp(
+            weight_ratio = self.smoothed_weights / previous_weights
+            requested = self.active_counts * weight_ratio
+            minimum = (self.group_sizes.to(torch.float64) * self.min_fraction).clamp_min(
+                self.min_per_group
+            )
+            bounded = torch.minimum(self.group_sizes, torch.maximum(requested, minimum))
+            self.active_counts = bounded.ceil().to(torch.long)
+
+        # Separate generator: deterministic selection does not consume model RNG.
+        generator = torch.Generator().manual_seed(self.seed + epoch)
+        chosen = [members[torch.randperm(len(members), generator=generator)[:count]]
+                  for members, count in zip(self.members, self.active_counts.tolist())]
+        active = torch.cat(chosen)
+        self.active_indices = active[torch.randperm(len(active), generator=generator)]
+        self.epoch = epoch
+
+    @property
+    def retention(self):
+        return self.active_counts.to(torch.float64) / self.group_sizes
+
+    @property
+    def overall_retention(self):
+        return int(self.active_counts.sum()) / self.full_size
+
+    @property
+    def model_weight_multipliers(self):
+        # Small, bounded bonus; NOT full inverse-probability compensation.
+        # Keep 20% with compensation=.25 -> multiply training weight by 1.20.
+        return 1 + self.compensation * (1 - self.retention)
+
+    @property
+    def pi_loss_multipliers(self):
+        # Original group frequency / selected group frequency. This corrects
+        # the pi signal only, not the model gradient. Exact frequency correction
+        # for fixed losses in expectation over the random subset/permutation;
+        # adaptive without-replacement training is not conditionally unbiased.
+        return self.overall_retention / self.retention
+
+    def __iter__(self):
+        if self.epoch == 0:
+            raise RuntimeError("Call set_epoch before iterating WeightAdaptiveSampler")
+        return iter(self.active_indices.tolist())
+
+    def __len__(self):
+        return int(self.active_counts.sum())
+
