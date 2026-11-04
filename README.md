@@ -12,3 +12,9 @@
 | 03.11.2026 16:09 | — | `adaptive` | 42 | 30 | 64,55 | 38,68 | 25% |
 | 04.11.2026 06:10 | — | `without_replacement` | — | 30 | 61,05 | 46,95 | — |
 | 04.11.2026 06:10 | — | `adaptive` | — | 30 | 59,90 | 40,30 | 25% |
+
+
+These ALSO runs used Learning Rate decay. That may have been an issue. I will be implementing LR Decay into my own algo and sampler but now will be switching ALSO back into constant LR.
+
+| Дата | Коммит | Режим | Seed | Эпохи | Лучшая val accuracy, % | Время обучения, мин | Процент компенсации |
+|---|---|---|---:|---:|---:|---:|---:|
