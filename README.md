@@ -18,3 +18,9 @@ These ALSO runs used Learning Rate decay. That may have been an issue. I will be
 
 | Дата | Коммит | Режим | Seed | Эпохи | Лучшая val accuracy, % | Время обучения, мин | Процент компенсации |
 |---|---|---|---:|---:|---:|---:|---:|
+
+
+Current to do:
+switch model to ResNet18 and data to CIFAR-10. 
+Experiments will be ran according to the ALSO paper from here on out.
+CIFAR-100 experiments will be moved to another branch later and main branch will be on CIFAR-10 
