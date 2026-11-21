@@ -32,7 +32,7 @@ class WeightAdaptiveSampler(Sampler):
 
     def __init__(
         self, group_ids, reference_weights, seed=42, warmup_epochs=2,
-        min_fraction=0.1, min_per_group=16, weight_ema=0.0,
+        min_fraction=0.1, min_per_group=16,
         compensation=0.25,
     ):
         ids = torch.as_tensor(group_ids, device="cpu")
@@ -49,8 +49,6 @@ class WeightAdaptiveSampler(Sampler):
             raise ValueError("min_fraction must be in (0, 1]")
         if min_per_group < 1 or int(min_per_group) != min_per_group:
             raise ValueError("min_per_group must be a positive integer")
-        if not 0 <= weight_ema < 1:
-            raise ValueError("weight_ema must be in [0, 1)")
         if not math.isfinite(compensation) or not 0 <= compensation <= 1:
             raise ValueError("compensation must be in [0, 1]")
 
@@ -64,9 +62,8 @@ class WeightAdaptiveSampler(Sampler):
         self.warmup_epochs = int(warmup_epochs)
         self.min_fraction = min_fraction
         self.min_per_group = int(min_per_group)
-        self.weight_ema = weight_ema
         self.compensation = compensation
-        self.smoothed_weights = self.reference_weights.clone()
+        self.previous_weights = self.reference_weights.clone()
         self.active_counts = self.group_sizes.clone()
         self.active_indices = torch.empty(0, dtype=torch.long)
         self.epoch = 0
@@ -88,16 +85,10 @@ class WeightAdaptiveSampler(Sampler):
         weights = self._normalize_weights(weights)
         if weights.shape != self.reference_weights.shape:
             raise ValueError("Weights must have one entry per group")
-        previous_weights = self.smoothed_weights
-        self.smoothed_weights = weights
-        if self.weight_ema:
-            self.smoothed_weights = (
-                self.weight_ema * previous_weights + (1 - self.weight_ema) * weights
-            )
         if epoch <= self.warmup_epochs:
             self.active_counts = self.group_sizes.clone()
         else:
-            weight_ratio = self.smoothed_weights / previous_weights
+            weight_ratio = weights / self.previous_weights
             requested = self.active_counts * weight_ratio
             minimum = (self.group_sizes.to(torch.float64) * self.min_fraction).clamp_min(
                 self.min_per_group
@@ -111,6 +102,7 @@ class WeightAdaptiveSampler(Sampler):
                   for members, count in zip(self.members, self.active_counts.tolist())]
         active = torch.cat(chosen)
         self.active_indices = active[torch.randperm(len(active), generator=generator)]
+        self.previous_weights = weights.clone()
         self.epoch = epoch
 
     @property
@@ -142,4 +134,5 @@ class WeightAdaptiveSampler(Sampler):
 
     def __len__(self):
         return int(self.active_counts.sum())
+
 

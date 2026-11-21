@@ -1,7 +1,7 @@
-"""CIFAR-10 / ResNet34 with fixed, random subgroups within each class.
+"""CIFAR-100 / ResNet34 with fixed, random subgroups within each class.
 
-The classifier always predicts 10 classes. ALSO and the sampler use separate
-group IDs: class_id * subgroups_per_class + subgroup_id. Defaults to 20 groups;
+The classifier always predicts 100 classes. ALSO and the sampler use separate
+group IDs: class_id * subgroups_per_class + subgroup_id. Defaults to 200 groups;
 --subgroups-per-class 1 restores class-level grouping. No changes to also.py or
 sampler.py are required. Validation remains at the original class level.
 """
@@ -25,8 +25,8 @@ from torchvision.models import resnet34
 from also import ALSO
 from sampler import NoReplacementSampler, WeightAdaptiveSampler
 
-N_CLASSES = 10
-VAL_PER_CLASS = 200  # Preserve the 48,000 train / 2,000 validation split.
+N_CLASSES = 100
+VAL_PER_CLASS = 20  # Preserve the 48,000 train / 2,000 validation split.
 
 
 def build_model():
@@ -92,7 +92,7 @@ class GroupedDataset(Dataset):
 
     def __getitem__(self, index):
         image, label = self.dataset[index]
-        return image, label, self.group_ids[index]
+        return image, label, self.group_ids[index], index
 
 
 def synchronize(device):
@@ -104,6 +104,92 @@ def learning_rate_for_epoch(args, epoch):
     """ALSO uses optimizer.lr, so a torch scheduler alone would not change it."""
     drops = sum(epoch > milestone for milestone in args.milestones) if args.scheduler == "multistep" else 0
     return args.lr * args.lr_gamma ** drops
+
+
+def save_distribution_plots(run_dir, per_epoch=False):
+    """Write 2 PNGs: unique images in the final epoch, by class and ALSO group.
+
+    Can also be called on an existing run with groups.pt and the metrics CSVs.
+    Each dataset index counts once; augmentations and repeated draws do not add images.
+    Rendering runs after training and is excluded from recorded epoch times.
+    Set per_epoch=True to write 2 PNGs for every completed epoch.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    run_dir = Path(run_dir)
+    assignment = torch.load(run_dir / "groups.pt", map_location="cpu", weights_only=True)
+    n_classes = int(assignment["n_classes"])
+    sizes = {
+        "classes": torch.bincount(assignment["train_labels"], minlength=n_classes).numpy(),
+        "groups": assignment["group_sizes"].numpy(),
+    }
+    histories = {}
+    for kind, filename, id_field in (
+        ("classes", "class_metrics.csv", "class_id"),
+        ("groups", "group_metrics.csv", "group"),
+    ):
+        history = {}
+        with (run_dir / filename).open(newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            if not {"train_unique"}.issubset(reader.fieldnames or []):
+                raise ValueError(
+                    f"{filename} has no unique-image counts. Draw counts cannot be used "
+                    "instead; use results from the updated training script."
+                )
+            for row in reader:
+                counts = history.setdefault(int(row["epoch"]), np.full(len(sizes[kind]), -1, dtype=np.int64))
+                index = int(row[id_field])
+                if counts[index] != -1:
+                    raise ValueError(f"Duplicate {kind} record in {filename}")
+                counts[index] = int(row["train_unique"])
+        histories[kind] = history
+    # Only render epochs fully recorded in both files (also useful after interruption).
+    epochs = sorted(set(histories["classes"]) & set(histories["groups"]))
+    epochs = [epoch for epoch in epochs
+              if all((histories[kind][epoch] >= 0).all() for kind in sizes)]
+    if not epochs:
+        return []
+    for epoch in epochs:
+        if histories["classes"][epoch].sum() != histories["groups"][epoch].sum():
+            raise ValueError(f"Class/group counts disagree in epoch {epoch}")
+        for kind, baseline in sizes.items():
+            counts = histories[kind][epoch]
+            if ((counts < 0) | (counts > baseline)).any():
+                raise ValueError(f"Invalid unique-image counts for {kind}, epoch {epoch}")
+    plot_dir = run_dir / "histograms"
+    plot_dir.mkdir(exist_ok=True)
+    # Remove obsolete generated charts when replotting an earlier run.
+    for filename in ("classes_total.png", "groups_total.png"):
+        (plot_dir / filename).unlink(missing_ok=True)
+    paths = []
+    for kind, baseline in sizes.items():
+        # Common epoch scale makes reductions and changes comparable across PNGs.
+        epoch_max = max(int(baseline.max()), *(int(histories[kind][e].max()) for e in epochs))
+        chart_epochs = epochs if per_epoch else epochs[-1:]
+        charts = [(f"epoch_{epoch:03d}", f"Epoch {epoch}", histories[kind][epoch], baseline, epoch_max)
+                  for epoch in chart_epochs]
+        for suffix, title, counts, reference, maximum in charts:
+            figure = Figure(figsize=(16 if len(baseline) > 30 else 11, 5), layout="constrained")
+            FigureCanvasAgg(figure)
+            ax = figure.subplots()
+            x = np.arange(len(baseline))
+            ax.bar(x - 0.2, reference, width=0.4, color="#1f77b4", label="Original data (before sampling)")
+            ax.bar(x + 0.2, counts, width=0.4, color="#ff7f0e", label="Selected data (unique images)")
+            label = "CIFAR class ID" if kind == "classes" else "ALSO group ID"
+            ax.set(title=f"{title}: {label} distribution", xlabel=label,
+                   ylabel="Number of unique images", ylim=(0, max(1, maximum) * 1.15),
+                   xlim=(-0.75, len(baseline) - 0.25))
+            ticks = np.unique(np.r_[np.arange(0, len(baseline), max(1, math.ceil(len(baseline) / 40))), len(baseline) - 1])
+            ax.set_xticks(ticks)
+            ax.set_axisbelow(True)
+            ax.grid(axis="y", alpha=0.2)
+            ax.legend(loc="upper right", fontsize=8)
+            path = plot_dir / f"{kind}_{suffix}.png"
+            figure.savefig(path, dpi=150)
+            figure.clear()
+            paths.append(path)
+    return paths
 
 
 def parse_args(argv=None):
@@ -131,8 +217,6 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--min-group-fraction", type=float, default=0.1)
     parser.add_argument("--min-per-group", type=int, default=16)
-    parser.add_argument("--weight-ema", type=float, default=0.0,
-                        help="Weight smoothing: 0 disables it; larger values react more slowly")
     parser.add_argument("--compensation", type=float, default=0.25,
                         help="Model-weight bonus = compensation * discarded group fraction (0..1)")
     parser.add_argument("--pi-correction", choices=["frequency", "none"], default="frequency",
@@ -141,6 +225,8 @@ def parse_args(argv=None):
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--smoke-test", action="store_true", help="Stop after two training batches")
     parser.add_argument("--no-save-model", action="store_true", help="Save metrics and sampling state only")
+    parser.add_argument("--histograms", type=int, choices=[0, 1], default=1,
+                        help="Save two distribution PNGs after training: 1=yes, 0=no (default: 1)")
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -150,8 +236,8 @@ def parse_args(argv=None):
         parser.error("epochs/batch-size must be positive; num-workers must be nonnegative")
     if args.crop_padding < 0 or args.warmup_epochs < 0 or args.min_per_group < 1:
         parser.error("Invalid crop-padding, warmup-epochs or min-per-group")
-    if not 0 < args.min_group_fraction <= 1 or not 0 <= args.weight_ema < 1:
-        parser.error("min-group-fraction must be in (0,1]; weight-ema in [0,1)")
+    if not 0 < args.min_group_fraction <= 1:
+        parser.error("min-group-fraction must be in (0,1]")
     if not 0 <= args.compensation <= 1:
         parser.error("compensation must be in [0,1]")
     if (not 0 < args.lr_gamma <= 1 or any(m < 1 for m in args.milestones)
@@ -166,6 +252,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.histograms:
+        # Fail before training if requested plots cannot be rendered.
+        from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: F401
     n_groups = N_CLASSES * args.subgroups_per_class
     random.seed(args.seed)
     np.random.seed(args.seed % (2**32))
@@ -188,8 +277,8 @@ def main(argv=None):
         transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize,
     ])
     val_transform = transforms.Compose([transforms.ToTensor(), normalize])
-    train_source = datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=train_transform)
-    val_source = datasets.CIFAR10(root=str(data_root), train=True, download=False, transform=val_transform)
+    train_source = datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=train_transform)
+    val_source = datasets.CIFAR100(root=str(data_root), train=True, download=False, transform=val_transform)
     targets = torch.tensor(train_source.targets)
     train_indices, val_indices = stratified_split(targets)
     torch.save({"train": train_indices, "validation": val_indices}, run_dir / "split.pt")
@@ -210,7 +299,7 @@ def main(argv=None):
         sampler = WeightAdaptiveSampler(
             train_group_ids, pi_uniform, seed=args.seed + 1,
             warmup_epochs=args.warmup_epochs, min_fraction=args.min_group_fraction,
-            min_per_group=args.min_per_group, weight_ema=args.weight_ema,
+            min_per_group=args.min_per_group,
             compensation=args.compensation,
         )
     elif args.sampling == "without_replacement":
@@ -237,7 +326,7 @@ def main(argv=None):
     config = {key: str(value) if isinstance(value, Path) else value
               for key, value in vars(args).items()}
     config.update(
-        optimizer="ALSO", dataset="CIFAR10", n_classes=N_CLASSES, n_groups=n_groups,
+        optimizer="ALSO", dataset="CIFAR100", n_classes=N_CLASSES, n_groups=n_groups,
         split_seed=42, val_per_class=VAL_PER_CLASS, alpha=1.0,
         grouping="fixed_random_within_class", group_assignment_file="groups.pt",
         validation_grouping="original_classes",
@@ -248,13 +337,16 @@ def main(argv=None):
         original_train_examples=len(train_dataset), validation_examples=len(val_indices),
         reference_weights=pi_uniform.cpu().tolist(), model_bonus_rule="1 + compensation * (1 - retention)",
         pi_correction_rule="overall_retention / group_retention; pi signal only",
-        training_script_version="cifar10_fixed_subgroups_v2", sampler_version=2,
+        training_script_version="cifar100_fixed_subgroups_v3", sampler_version=3,
         adaptive_count_rule="previous active count * current weight / previous epoch weight",
         upstream_commit="bc4a5d8de99de382fc87632da46357280b16e6b9",
+        histogram_directory="histograms" if args.histograms else None,
+        histogram_count_rule="2: final epoch, by class and group" if args.histograms else "0 (disabled)",
+        histogram_counts="unique dataset indices within each epoch",
     )
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     torch.save(optimizer.pi.detach().cpu(), run_dir / "pi_initial.pt")
-    print("Датасет: CIFAR-10; модель: torchvision ResNet34, вход адаптирован под CIFAR")
+    print("Датасет: CIFAR-100; модель: torchvision ResNet34, вход адаптирован под CIFAR")
     print(f"Классов модели: {N_CLASSES}; групп ALSO: {n_groups} "
           f"({args.subgroups_per_class} на класс), group seed={args.group_seed}")
     print(f"Размеры подгрупп: {int(group_sizes.min())}..{int(group_sizes.max())}")
@@ -277,12 +369,13 @@ def main(argv=None):
     ]
     group_fields = [
         "epoch", "group", "class_id", "subgroup_id", "group_size", "active_count", "retention",
-        "pi_start", "pi_smoothed",
+        "pi_start",
         "pi_end", "model_multiplier", "effective_weight_start", "pi_loss_multiplier",
-        "train_seen", "train_mean_loss",
+        "train_seen", "train_mean_loss", "train_unique",
     ]
     class_fields = [
         "epoch", "class_id", "train_seen", "train_mean_loss", "val_count", "val_accuracy",
+        "train_unique",
     ]
     best_val_accuracy, cumulative_seconds, cumulative_examples = -1.0, 0.0, 0
     with (run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as file, \
@@ -302,7 +395,6 @@ def main(argv=None):
                 sampler.set_epoch(epoch, pi_start)
                 active_counts = sampler.active_counts.clone()
                 retention = sampler.retention
-                smoothed = sampler.smoothed_weights
                 model_factors = sampler.model_weight_multipliers.to(device=device, dtype=optimizer.pi.dtype)
                 pi_factors = sampler.pi_loss_multipliers.to(device=device, dtype=optimizer.pi.dtype)
                 if args.pi_correction == "none":
@@ -312,12 +404,12 @@ def main(argv=None):
                     "epoch": epoch, "active_subset_indices": sampler.active_indices,
                     "active_source_indices": torch.tensor(train_indices)[sampler.active_indices],
                     "group_sizes": group_sizes, "active_counts": active_counts,
-                    "pi_start": pi_start, "smoothed_weights": smoothed,
+                    "pi_start": pi_start,
                     "model_weight_multipliers": model_factors.cpu(),
                     "pi_loss_multipliers": pi_factors.cpu(),
                 }, run_dir / f"sampler_epoch_{epoch:03d}.pt")
             else:
-                active_counts, retention, smoothed = group_sizes, torch.ones(n_groups), pi_start
+                active_counts, retention = group_sizes, torch.ones(n_groups)
                 model_factors = torch.ones_like(optimizer.pi)
                 pi_factors = torch.ones_like(optimizer.pi)
             print(f"Эпоха {epoch}: {len(sampler)}/{len(train_dataset)} изображений, "
@@ -328,7 +420,8 @@ def main(argv=None):
             train_loss_sum, train_correct, train_count = 0.0, 0, 0
             train_group_loss = torch.zeros(n_groups, device=device)
             train_group_count = torch.zeros(n_groups, dtype=torch.long, device=device)
-            for step, (images, labels, group_ids) in enumerate(train_loader, start=1):
+            epoch_seen_mask = torch.zeros(len(train_dataset), dtype=torch.bool)
+            for step, (images, labels, group_ids, sample_indices) in enumerate(train_loader, start=1):
                 images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 group_ids = group_ids.to(device, non_blocking=True)
                 optimizer.loss_scale = n_groups / labels.numel()  # Includes the short final batch.
@@ -371,6 +464,7 @@ def main(argv=None):
                 train_loss_sum += losses.sum().item()
                 train_correct += (logits.argmax(dim=1) == labels).sum().item()
                 train_count += labels.numel()
+                epoch_seen_mask[sample_indices] = True
                 train_group_loss.index_add_(0, group_ids, losses)
                 train_group_count += torch.bincount(group_ids, minlength=n_groups)
                 if step % 100 == 0:
@@ -407,16 +501,19 @@ def main(argv=None):
                 save_model(run_dir / "model_best.pt", epoch, val_accuracy)
             if epoch == args.epochs:
                 save_model(run_dir / "model_last.pt", epoch, val_accuracy)
+            unique_groups = torch.bincount(train_group_ids[epoch_seen_mask], minlength=n_groups)
+            unique_classes = torch.bincount(train_labels[epoch_seen_mask], minlength=N_CLASSES)
             seen, group_loss = train_group_count.cpu(), train_group_loss.cpu()
             bonus, correction = model_factors.cpu(), pi_factors.cpu()
             for group in range(n_groups):
                 group_writer.writerow(dict(
                     epoch=epoch, group=group, group_size=int(group_sizes[group]),
+                    train_unique=int(unique_groups[group]),
                     class_id=group // args.subgroups_per_class,
                     subgroup_id=group % args.subgroups_per_class,
                     active_count=int(active_counts[group]) if args.sampling != "with_replacement" else "",
                     retention=float(retention[group]) if args.sampling != "with_replacement" else "",
-                    pi_start=float(pi_start[group]), pi_smoothed=float(smoothed[group]),
+                    pi_start=float(pi_start[group]),
                     pi_end=float(pi_end[group]), model_multiplier=float(bonus[group]),
                     effective_weight_start=float(pi_start[group] * bonus[group]),
                     pi_loss_multiplier=float(correction[group]), train_seen=int(seen[group]),
@@ -430,6 +527,7 @@ def main(argv=None):
             for class_id in range(N_CLASSES):
                 class_writer.writerow(dict(
                     epoch=epoch, class_id=class_id, train_seen=int(class_seen[class_id]),
+                    train_unique=int(unique_classes[class_id]),
                     train_mean_loss=(float(class_loss[class_id] / class_seen[class_id])
                                      if class_seen[class_id] else ""),
                     val_count=int(val_counts_cpu[class_id]),
@@ -455,8 +553,12 @@ def main(argv=None):
             print(f"Эпоха {epoch}/{args.epochs} | train acc {train_correct / train_count:.1%} | "
                   f"val acc {val_accuracy:.2%} | best {best_val_accuracy:.2%} | "
                   f"оставлено {train_count / len(train_dataset):.1%} | {seconds:.1f} сек.")
+    if args.histograms:
+        plots = save_distribution_plots(run_dir)
+        print(f"Гистограммы: {len(plots)} PNG в {run_dir / 'histograms'}")
     return run_dir
 
 
 if __name__ == "__main__":
     main()
+
