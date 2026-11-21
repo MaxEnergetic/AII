@@ -4,3 +4,7 @@ __pycache__/
 data/
 runs/**/model_best.pt
 runs/**/model_last.pt
+/runs/
+/old/runs/
+*.py[cod]
+.ipynb_checkpoints/
