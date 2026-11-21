@@ -1,4 +1,10 @@
-"""CIFAR-100 / ResNet34: original ALSO or ALSO with adaptive group subsampling."""
+"""CIFAR-10 / ResNet34 with fixed, random subgroups within each class.
+
+The classifier always predicts 10 classes. ALSO and the sampler use separate
+group IDs: class_id * subgroups_per_class + subgroup_id. Defaults to 20 groups;
+--subgroups-per-class 1 restores class-level grouping. No changes to also.py or
+sampler.py are required. Validation remains at the original class level.
+"""
 
 import argparse
 import csv
@@ -12,18 +18,19 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, RandomSampler, Subset
+from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from torchvision import datasets, transforms
 from torchvision.models import resnet34
 
 from also import ALSO
 from sampler import NoReplacementSampler, WeightAdaptiveSampler
 
-N_GROUPS = 100
+N_CLASSES = 10
+VAL_PER_CLASS = 200  # Preserve the 48,000 train / 2,000 validation split.
 
 
 def build_model():
-    model = resnet34(weights=None, num_classes=N_GROUPS)
+    model = resnet34(weights=None, num_classes=N_CLASSES)
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
     nn.init.kaiming_normal_(model.conv1.weight, mode="fan_out", nonlinearity="relu")
@@ -33,14 +40,59 @@ def build_model():
 def stratified_split(targets):
     generator = torch.Generator().manual_seed(42)
     train_indices, val_indices = [], []
-    for group in range(N_GROUPS):
+    for group in range(N_CLASSES):
         indices = torch.where(targets == group)[0]
-        if len(indices) <= 20:
-            raise ValueError(f"Group {group} needs more than 20 examples")
+        if len(indices) <= VAL_PER_CLASS:
+            raise ValueError(f"Class {group} needs more than {VAL_PER_CLASS} examples")
         indices = indices[torch.randperm(len(indices), generator=generator)]
-        val_indices.extend(indices[:20].tolist())
-        train_indices.extend(indices[20:].tolist())
+        val_indices.extend(indices[:VAL_PER_CLASS].tolist())
+        train_indices.extend(indices[VAL_PER_CLASS:].tolist())
     return train_indices, val_indices
+
+
+def make_group_ids(labels, parts=2, seed=123):
+    """Split each training class into fixed, nearly equal random subgroups.
+
+    Returned positions align with the training Subset, not CIFAR source IDs.
+    A private generator keeps this split independent of the model's RNG.
+    """
+    labels = torch.as_tensor(labels, dtype=torch.long, device="cpu")
+    if labels.ndim != 1 or labels.numel() == 0:
+        raise ValueError("labels must be a nonempty vector")
+    if parts < 1 or int(parts) != parts:
+        raise ValueError("parts must be a positive integer")
+    if labels.min() < 0 or labels.max() >= N_CLASSES:
+        raise ValueError("Class labels must be in [0, N_CLASSES)")
+    parts = int(parts)
+    generator = torch.Generator().manual_seed(seed)
+    group_ids = torch.empty_like(labels)
+    for class_id in range(N_CLASSES):
+        positions = torch.where(labels == class_id)[0]
+        if len(positions) < parts:
+            raise ValueError(f"Class {class_id} has fewer training items than subgroups")
+        # With one subgroup, recover the original class IDs exactly.
+        if parts > 1:
+            positions = positions[torch.randperm(len(positions), generator=generator)]
+        for subgroup_id, chunk in enumerate(positions.tensor_split(parts)):
+            group_ids[chunk] = class_id * parts + subgroup_id
+    return group_ids
+
+
+class GroupedDataset(Dataset):
+    """Keep classification labels separate from fixed ALSO group IDs."""
+
+    def __init__(self, dataset, group_ids):
+        self.dataset = dataset
+        self.group_ids = torch.as_tensor(group_ids, dtype=torch.long, device="cpu").clone()
+        if self.group_ids.ndim != 1 or len(self.group_ids) != len(dataset):
+            raise ValueError("One group ID is required per training item")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        image, label = self.dataset[index]
+        return image, label, self.group_ids[index]
 
 
 def synchronize(device):
@@ -66,6 +118,10 @@ def parse_args(argv=None):
     parser.add_argument("--milestones", type=int, nargs="*", default=[10, 15])
     parser.add_argument("--lr-gamma", type=float, default=1 / 3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--subgroups-per-class", type=int, default=2,
+                        help="Fixed random subgroups per class; 1 restores class-level grouping")
+    parser.add_argument("--group-seed", type=int, default=123,
+                        help="Independent seed for the fixed training subgroup assignment")
     parser.add_argument("--crop-padding", type=int, default=4)
     parser.add_argument("--sampling", choices=["adaptive", "without_replacement", "with_replacement"],
                         default="adaptive")
@@ -88,6 +144,8 @@ def parse_args(argv=None):
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     args = parser.parse_args(argv)
+    if args.subgroups_per_class < 1:
+        parser.error("subgroups-per-class must be positive")
     if args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0:
         parser.error("epochs/batch-size must be positive; num-workers must be nonnegative")
     if args.crop_padding < 0 or args.warmup_epochs < 0 or args.min_per_group < 1:
@@ -108,6 +166,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    n_groups = N_CLASSES * args.subgroups_per_class
     random.seed(args.seed)
     np.random.seed(args.seed % (2**32))
     torch.manual_seed(args.seed)
@@ -129,15 +188,24 @@ def main(argv=None):
         transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize,
     ])
     val_transform = transforms.Compose([transforms.ToTensor(), normalize])
-    train_source = datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=train_transform)
-    val_source = datasets.CIFAR100(root=str(data_root), train=True, download=False, transform=val_transform)
+    train_source = datasets.CIFAR10(root=str(data_root), train=True, download=True, transform=train_transform)
+    val_source = datasets.CIFAR10(root=str(data_root), train=True, download=False, transform=val_transform)
     targets = torch.tensor(train_source.targets)
     train_indices, val_indices = stratified_split(targets)
     torch.save({"train": train_indices, "validation": val_indices}, run_dir / "split.pt")
-    train_dataset = Subset(train_source, train_indices)
-    train_group_ids = targets[train_indices]  # Positions align with train_dataset.
-    group_sizes = torch.bincount(train_group_ids, minlength=N_GROUPS)
-    pi_uniform = torch.full((N_GROUPS,), 1 / N_GROUPS, device=device)
+    train_labels = targets[train_indices]
+    train_group_ids = make_group_ids(train_labels, args.subgroups_per_class, args.group_seed)
+    train_dataset = GroupedDataset(Subset(train_source, train_indices), train_group_ids)
+    group_sizes = torch.bincount(train_group_ids, minlength=n_groups)
+    # Save the exact mapping once; every epoch uses these same subgroups.
+    torch.save({
+        "train_source_indices": torch.tensor(train_indices),
+        "train_labels": train_labels, "train_group_ids": train_group_ids,
+        "group_sizes": group_sizes, "n_classes": N_CLASSES, "n_groups": n_groups,
+        "subgroups_per_class": args.subgroups_per_class, "group_seed": args.group_seed,
+        "group_rule": "class_id * subgroups_per_class + subgroup_id",
+    }, run_dir / "groups.pt")
+    pi_uniform = torch.full((n_groups,), 1 / n_groups, device=device)
     if args.sampling == "adaptive":
         sampler = WeightAdaptiveSampler(
             train_group_ids, pi_uniform, seed=args.seed + 1,
@@ -162,27 +230,34 @@ def main(argv=None):
     )
     model = build_model().to(device)
     optimizer = ALSO(
-        model.parameters(), n_groups=N_GROUPS, batch_size=args.batch_size,
+        model.parameters(), n_groups=n_groups, batch_size=args.batch_size,
         mode=args.mode, alpha=1.0, lr=args.lr, weight_decay=args.weight_decay,
         pi_lr=args.pi_lr, pi_decay=args.pi_decay, pi_init=pi_uniform, pi_reg=pi_uniform,
     )
     config = {key: str(value) if isinstance(value, Path) else value
               for key, value in vars(args).items()}
     config.update(
-        optimizer="ALSO", n_groups=N_GROUPS, split_seed=42, alpha=1.0,
+        optimizer="ALSO", dataset="CIFAR10", n_classes=N_CLASSES, n_groups=n_groups,
+        split_seed=42, val_per_class=VAL_PER_CLASS, alpha=1.0,
+        grouping="fixed_random_within_class", group_assignment_file="groups.pt",
+        validation_grouping="original_classes",
+        legacy_val_worst_group_accuracy="alias of val_worst_class_accuracy",
         architecture="torchvision_resnet34_cifar", pretrained=False,
         settings_reference_run="20261023_001356", settings_reference_commit="d961aaa",
         sampler_class=type(sampler).__name__, data_root=str(data_root), device=str(device),
         original_train_examples=len(train_dataset), validation_examples=len(val_indices),
         reference_weights=pi_uniform.cpu().tolist(), model_bonus_rule="1 + compensation * (1 - retention)",
         pi_correction_rule="overall_retention / group_retention; pi signal only",
-        source_commit="5cea735", sampler_version=2,
+        training_script_version="cifar10_fixed_subgroups_v2", sampler_version=2,
         adaptive_count_rule="previous active count * current weight / previous epoch weight",
         upstream_commit="bc4a5d8de99de382fc87632da46357280b16e6b9",
     )
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     torch.save(optimizer.pi.detach().cpu(), run_dir / "pi_initial.pt")
-    print("Модель: torchvision ResNet34, вход адаптирован под CIFAR")
+    print("Датасет: CIFAR-10; модель: torchvision ResNet34, вход адаптирован под CIFAR")
+    print(f"Классов модели: {N_CLASSES}; групп ALSO: {n_groups} "
+          f"({args.subgroups_per_class} на класс), group seed={args.group_seed}")
+    print(f"Размеры подгрупп: {int(group_sizes.min())}..{int(group_sizes.max())}")
     print(f"Параметров: {sum(p.numel() for p in model.parameters()):,}; устройство: {device}")
     print(f"Семплер: {type(sampler).__name__}; режим ALSO: {args.mode}")
     print(f"Train: {len(train_dataset)}, validation: {len(val_indices)}; результаты: {run_dir}")
@@ -197,19 +272,27 @@ def main(argv=None):
         "epoch", "train_loss", "train_accuracy", "val_loss", "val_accuracy", "seconds",
         "train_examples", "full_train_examples", "kept_fraction", "train_batches",
         "cumulative_train_examples", "train_seconds", "validation_seconds", "cumulative_seconds",
-        "val_worst_group_accuracy", "pi_min", "pi_max", "pi_entropy", "max_model_bonus", "learning_rate",
+        "val_worst_class_accuracy", "val_worst_group_accuracy", "pi_min", "pi_max", "pi_entropy",
+        "max_model_bonus", "learning_rate",
     ]
     group_fields = [
-        "epoch", "group", "group_size", "active_count", "retention", "pi_start", "pi_smoothed",
+        "epoch", "group", "class_id", "subgroup_id", "group_size", "active_count", "retention",
+        "pi_start", "pi_smoothed",
         "pi_end", "model_multiplier", "effective_weight_start", "pi_loss_multiplier",
-        "train_seen", "train_mean_loss", "val_count", "val_accuracy",
+        "train_seen", "train_mean_loss",
+    ]
+    class_fields = [
+        "epoch", "class_id", "train_seen", "train_mean_loss", "val_count", "val_accuracy",
     ]
     best_val_accuracy, cumulative_seconds, cumulative_examples = -1.0, 0.0, 0
     with (run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as file, \
-            (run_dir / "group_metrics.csv").open("w", newline="", encoding="utf-8") as group_file:
+            (run_dir / "group_metrics.csv").open("w", newline="", encoding="utf-8") as group_file, \
+            (run_dir / "class_metrics.csv").open("w", newline="", encoding="utf-8") as class_file:
         writer, group_writer = csv.DictWriter(file, metric_fields), csv.DictWriter(group_file, group_fields)
+        class_writer = csv.DictWriter(class_file, class_fields)
         writer.writeheader()
         group_writer.writeheader()
+        class_writer.writeheader()
         for epoch in range(1, args.epochs + 1):
             synchronize(device)
             epoch_start = time.perf_counter()
@@ -234,7 +317,7 @@ def main(argv=None):
                     "pi_loss_multipliers": pi_factors.cpu(),
                 }, run_dir / f"sampler_epoch_{epoch:03d}.pt")
             else:
-                active_counts, retention, smoothed = group_sizes, torch.ones(N_GROUPS), pi_start
+                active_counts, retention, smoothed = group_sizes, torch.ones(n_groups), pi_start
                 model_factors = torch.ones_like(optimizer.pi)
                 pi_factors = torch.ones_like(optimizer.pi)
             print(f"Эпоха {epoch}: {len(sampler)}/{len(train_dataset)} изображений, "
@@ -243,11 +326,12 @@ def main(argv=None):
             train_start = time.perf_counter()
             model.train()
             train_loss_sum, train_correct, train_count = 0.0, 0, 0
-            train_group_loss = torch.zeros(N_GROUPS, device=device)
-            train_group_count = torch.zeros(N_GROUPS, dtype=torch.long, device=device)
-            for step, (images, labels) in enumerate(train_loader, start=1):
+            train_group_loss = torch.zeros(n_groups, device=device)
+            train_group_count = torch.zeros(n_groups, dtype=torch.long, device=device)
+            for step, (images, labels, group_ids) in enumerate(train_loader, start=1):
                 images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                optimizer.loss_scale = N_GROUPS / labels.numel()  # Includes the short final batch.
+                group_ids = group_ids.to(device, non_blocking=True)
+                optimizer.loss_scale = n_groups / labels.numel()  # Includes the short final batch.
                 batch_log = {}
 
                 def closure(weights, scale):
@@ -271,7 +355,7 @@ def main(argv=None):
                     return scaled_losses.detach(), raw_losses.detach().mean().item()
 
                 closure.device = device
-                optimizer.step(closure, labels, model_weight_multipliers=model_factors,
+                optimizer.step(closure, group_ids, model_weight_multipliers=model_factors,
                                pi_loss_multipliers=pi_factors)
                 pi = optimizer.pi.detach()
                 if not torch.isfinite(pi).all() or not (pi > 0).all():
@@ -287,8 +371,8 @@ def main(argv=None):
                 train_loss_sum += losses.sum().item()
                 train_correct += (logits.argmax(dim=1) == labels).sum().item()
                 train_count += labels.numel()
-                train_group_loss.index_add_(0, labels, losses)
-                train_group_count += torch.bincount(labels, minlength=N_GROUPS)
+                train_group_loss.index_add_(0, group_ids, losses)
+                train_group_count += torch.bincount(group_ids, minlength=n_groups)
                 if step % 100 == 0:
                     print(f"  Батч {step}/{len(train_loader)}")
             if train_count != len(sampler):
@@ -300,8 +384,8 @@ def main(argv=None):
             validation_start = time.perf_counter()
             model.eval()
             val_loss_sum, val_correct, val_count = 0.0, 0, 0
-            val_group_count = torch.zeros(N_GROUPS, dtype=torch.long, device=device)
-            val_group_correct = torch.zeros_like(val_group_count)
+            val_class_count = torch.zeros(N_CLASSES, dtype=torch.long, device=device)
+            val_class_correct = torch.zeros_like(val_class_count)
             with torch.no_grad():
                 for images, labels in val_loader:
                     images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -310,12 +394,12 @@ def main(argv=None):
                     val_loss_sum += nn.functional.cross_entropy(logits, labels, reduction="sum").item()
                     val_correct += correct.sum().item()
                     val_count += labels.numel()
-                    val_group_count += torch.bincount(labels, minlength=N_GROUPS)
-                    val_group_correct.index_add_(0, labels, correct.long())
+                    val_class_count += torch.bincount(labels, minlength=N_CLASSES)
+                    val_class_correct.index_add_(0, labels, correct.long())
             synchronize(device)
             validation_seconds = time.perf_counter() - validation_start
             val_accuracy = val_correct / val_count
-            val_group_accuracy = val_group_correct.float() / val_group_count
+            val_class_accuracy = val_class_correct.float() / val_class_count
             pi_end = optimizer.pi.detach().cpu()
             torch.save(pi_end, run_dir / f"pi_epoch_{epoch:03d}.pt")
             if val_accuracy > best_val_accuracy:
@@ -325,9 +409,11 @@ def main(argv=None):
                 save_model(run_dir / "model_last.pt", epoch, val_accuracy)
             seen, group_loss = train_group_count.cpu(), train_group_loss.cpu()
             bonus, correction = model_factors.cpu(), pi_factors.cpu()
-            for group in range(N_GROUPS):
+            for group in range(n_groups):
                 group_writer.writerow(dict(
                     epoch=epoch, group=group, group_size=int(group_sizes[group]),
+                    class_id=group // args.subgroups_per_class,
+                    subgroup_id=group % args.subgroups_per_class,
                     active_count=int(active_counts[group]) if args.sampling != "with_replacement" else "",
                     retention=float(retention[group]) if args.sampling != "with_replacement" else "",
                     pi_start=float(pi_start[group]), pi_smoothed=float(smoothed[group]),
@@ -335,9 +421,21 @@ def main(argv=None):
                     effective_weight_start=float(pi_start[group] * bonus[group]),
                     pi_loss_multiplier=float(correction[group]), train_seen=int(seen[group]),
                     train_mean_loss=float(group_loss[group] / seen[group]) if seen[group] else "",
-                    val_count=int(val_group_count[group]), val_accuracy=float(val_group_accuracy[group]),
                 ))
             group_file.flush()
+            class_seen = seen.reshape(N_CLASSES, args.subgroups_per_class).sum(dim=1)
+            class_loss = group_loss.reshape(N_CLASSES, args.subgroups_per_class).sum(dim=1)
+            val_counts_cpu = val_class_count.cpu()
+            val_accuracy_cpu = val_class_accuracy.cpu()
+            for class_id in range(N_CLASSES):
+                class_writer.writerow(dict(
+                    epoch=epoch, class_id=class_id, train_seen=int(class_seen[class_id]),
+                    train_mean_loss=(float(class_loss[class_id] / class_seen[class_id])
+                                     if class_seen[class_id] else ""),
+                    val_count=int(val_counts_cpu[class_id]),
+                    val_accuracy=float(val_accuracy_cpu[class_id]),
+                ))
+            class_file.flush()
             seconds = time.perf_counter() - epoch_start
             cumulative_seconds += seconds
             cumulative_examples += train_count
@@ -347,7 +445,9 @@ def main(argv=None):
                 train_examples=train_count, full_train_examples=len(train_dataset), kept_fraction=train_count / len(train_dataset),
                 train_batches=len(train_loader), cumulative_train_examples=cumulative_examples,
                 train_seconds=train_seconds, validation_seconds=validation_seconds, cumulative_seconds=cumulative_seconds,
-                val_worst_group_accuracy=float(val_group_accuracy.min()), pi_min=float(pi_end.min()),
+                val_worst_class_accuracy=float(val_class_accuracy.min()),
+                # Compatibility with old readers: this remains a CLASS-level metric.
+                val_worst_group_accuracy=float(val_class_accuracy.min()), pi_min=float(pi_end.min()),
                 pi_max=float(pi_end.max()), pi_entropy=float(-(pi_end * pi_end.log()).sum()),
                 max_model_bonus=float(bonus.max() - 1), learning_rate=optimizer.lr,
             ))
