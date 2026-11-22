@@ -208,7 +208,6 @@ def parse_args(argv=None):
                         help="Fixed random subgroups per class; 1 restores class-level grouping")
     parser.add_argument("--group-seed", type=int, default=123,
                         help="Independent seed for the fixed training subgroup assignment")
-    parser.add_argument("--crop-padding", type=int, default=4)
     parser.add_argument("--sampling", choices=["adaptive", "without_replacement", "with_replacement"],
                         default="adaptive")
     parser.add_argument("--pi-lr", type=float, default=1e-3)
@@ -234,8 +233,8 @@ def parse_args(argv=None):
         parser.error("subgroups-per-class must be positive")
     if args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0:
         parser.error("epochs/batch-size must be positive; num-workers must be nonnegative")
-    if args.crop_padding < 0 or args.warmup_epochs < 0 or args.min_per_group < 1:
-        parser.error("Invalid crop-padding, warmup-epochs or min-per-group")
+    if args.warmup_epochs < 0 or args.min_per_group < 1:
+        parser.error("Invalid warmup-epochs or min-per-group")
     if not 0 < args.min_group_fraction <= 1:
         parser.error("min-group-fraction must be in (0,1]")
     if not 0 <= args.compensation <= 1:
@@ -272,10 +271,7 @@ def main(argv=None):
     run_dir.mkdir(parents=True, exist_ok=False)
 
     normalize = transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=args.crop_padding),
-        transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize,
-    ])
+    train_transform = transforms.Compose([transforms.ToTensor(), normalize])
     val_transform = transforms.Compose([transforms.ToTensor(), normalize])
     train_source = datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=train_transform)
     val_source = datasets.CIFAR100(root=str(data_root), train=True, download=False, transform=val_transform)
@@ -330,6 +326,7 @@ def main(argv=None):
         split_seed=42, val_per_class=VAL_PER_CLASS, alpha=1.0,
         grouping="fixed_random_within_class", group_assignment_file="groups.pt",
         validation_grouping="original_classes",
+        train_augmentation=False,
         legacy_val_worst_group_accuracy="alias of val_worst_class_accuracy",
         architecture="torchvision_resnet34_cifar", pretrained=False,
         settings_reference_run="20261023_001356", settings_reference_commit="d961aaa",
