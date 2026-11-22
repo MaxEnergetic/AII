@@ -271,7 +271,12 @@ def main(argv=None):
     run_dir.mkdir(parents=True, exist_ok=False)
 
     normalize = transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    train_transform = transforms.Compose([transforms.ToTensor(), normalize])
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
     val_transform = transforms.Compose([transforms.ToTensor(), normalize])
     train_source = datasets.CIFAR100(root=str(data_root), train=True, download=True, transform=train_transform)
     val_source = datasets.CIFAR100(root=str(data_root), train=True, download=False, transform=val_transform)
@@ -326,7 +331,7 @@ def main(argv=None):
         split_seed=42, val_per_class=VAL_PER_CLASS, alpha=1.0,
         grouping="fixed_random_within_class", group_assignment_file="groups.pt",
         validation_grouping="original_classes",
-        train_augmentation=False,
+        train_augmentation=True,
         legacy_val_worst_group_accuracy="alias of val_worst_class_accuracy",
         architecture="torchvision_resnet34_cifar", pretrained=False,
         settings_reference_run="20261023_001356", settings_reference_commit="d961aaa",
